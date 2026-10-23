@@ -96,6 +96,24 @@ def active_chain(rows):
     return chain
 
 
+def chain_break(rows, chain):
+    """主线的第一行如果 parentUuid 不是 null、文件里却找不到那一行，说明会话链在这里断了。
+
+    返回断点那一行（主线第一行），没断返回 None。压缩边界、slim 产物的第一行 parentUuid
+    都是 null，是正常起点，不算断。Claude Code 恢复时遇到断链会按时间戳找一行接回去，
+    slim.py 不会，所以断点之前的内容沿链走不到。
+    """
+    if not chain:
+        return None
+    head = chain[0]
+    parent = head.get("parentUuid")
+    if not parent:
+        return None
+    reachable = {r.get("uuid") for r in rows if r.get("uuid") and r.get("isSidechain") is not True
+                 and r.get("type") in CHAIN_TYPES}
+    return head if parent not in reachable else None
+
+
 def blocks(row):
     content = (row.get("message") or {}).get("content")
     return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
@@ -432,24 +450,74 @@ def iso_label(ts, tz):
 
 # ---------- dialogue：投影成对话 ----------
 
+def interjection_texts(row):
+    """工具结果行里夹带的文字块（人在工具跑的时候插的话）。<system-reminder> 开头的是系统注入，不算。"""
+    if row.get("type") != "user" or row.get("isMeta") or not result_ids(row):
+        return []
+    out = []
+    for b in blocks(row):
+        if b.get("type") != "text":
+            continue
+        text = b.get("text") or ""
+        if not text.strip() or text.lstrip().startswith("<system-reminder>"):
+            continue
+        out.append(text)
+    return out
+
+
 def project_dialogue(kept, keep_tools, extra_results, add_time, tz, stats):
     """把保留段投影成对话事件：人说的话、AI 说的话、要保留的工具（调用和结果一起）。
 
     工具以「一对」为单位出事件：遇到 tool_use 时把它的结果一起带上，
     结果行后面再遇到就跳过。并行调用因此也是 调用1→结果1→调用2→结果2。
+    结果行里夹带的人类文字单独出一条人说的话：结果属于保留的工具对时紧跟在那一对后面，
+    否则留在结果行原来的位置。
     """
     results = {}  # tool_use_id → (结果块, toolUseResult, 时间戳)
+    result_row = {}  # tool_use_id → 结果所在的那一行
     for row in kept:
         for b in blocks(row):
             if row.get("type") == "user" and b.get("type") == "tool_result":
                 results.setdefault(b.get("tool_use_id"),
                                    (b, row.get("toolUseResult"), row.get("timestamp")))
+                result_row.setdefault(b.get("tool_use_id"), row)
     for rid, row in extra_results.items():
         for b in blocks(row):
             if b.get("type") == "tool_result" and b.get("tool_use_id") == rid:
                 results.setdefault(rid, (b, row.get("toolUseResult"), row.get("timestamp")))
+                result_row.setdefault(rid, row)
+
+    def stamp(text, ts):
+        if not add_time or TIME_PREFIX_RE.match(text):
+            return text  # 不加时间，或上一次 slim 已经加过，不再叠一层
+        label = iso_label(ts, tz)
+        if label:
+            return f"[消息发送时间：{label}]\n{text}"
+        stats["no_time_prompts"] += 1
+        return text
 
     events = []  # (kind, payload, timestamp)
+    spoken = set()  # 夹带文字已经出过事件的结果行
+    # 夹带文字的结果行里有几个结果属于会保留的工具对：数到 0 时文字紧跟最后那一对出
+    kept_names = {b.get("id"): b.get("name") for r in kept if r.get("type") == "assistant"
+                  for b in blocks(r) if b.get("type") == "tool_use"}
+    waiting = {}
+    for row in list(kept) + list(extra_results.values()):
+        if id(row) in waiting or not interjection_texts(row):
+            continue
+        n = sum(1 for i in result_ids(row) if kept_names.get(i) in keep_tools)
+        if n:
+            waiting[id(row)] = n
+
+    def emit_interjection(row):
+        if id(row) in spoken:
+            return
+        spoken.add(id(row))
+        texts = interjection_texts(row)
+        if texts:
+            stats["interjections"] = stats.get("interjections", 0) + len(texts)
+            events.append(("user", stamp("\n".join(texts), row.get("timestamp")), row.get("timestamp")))
+
     for row in kept:
         ts = row.get("timestamp")
         kind = row.get("type")
@@ -464,16 +532,10 @@ def project_dialogue(kept, keep_tools, extra_results, add_time, tz, stats):
                 text = prompt_text(row)
                 if text.startswith(("<command-", "<local-command-")):
                     continue  # 斜杠命令和它的输出，不是对话
-                if add_time and TIME_PREFIX_RE.match(text):
-                    pass  # 上一次 slim 已经加过发送时间，不再叠一层
-                elif add_time:
-                    label = iso_label(ts, tz)
-                    if label:
-                        text = f"[消息发送时间：{label}]\n{text}"
-                    else:
-                        stats["no_time_prompts"] += 1
-                events.append(("user", text, ts))
-            # 工具结果行：结果已经跟着它的调用出过了，这里不再输出
+                events.append(("user", stamp(text, ts), ts))
+            elif result_ids(row):
+                # 工具结果行：结果已经跟着它的调用出过了；夹带的人类文字没跟着出过的，在这里出
+                emit_interjection(row)
         elif kind == "assistant":
             for b in blocks(row):
                 t = b.get("type")
@@ -483,6 +545,11 @@ def project_dialogue(kept, keep_tools, extra_results, add_time, tz, stats):
                     hit = results.get(b.get("id"))
                     if b.get("name") in keep_tools and hit is not None:
                         events.append(("tool_pair", {"use": b, "result": hit}, ts))
+                        rrow = result_row.get(b.get("id"))
+                        if rrow is not None and id(rrow) in waiting:
+                            waiting[id(rrow)] -= 1
+                            if waiting[id(rrow)] <= 0:  # 这一行里最后一个保留的工具对出完了
+                                emit_interjection(rrow)
                     # 其他工具、没有结果的调用：丢掉
                 # thinking、图片之外的其他块：丢掉
     return events
@@ -823,7 +890,14 @@ def run(args):
     if not turns:
         raise SlimError("这份文件里找不到对话轮次。")
 
+    broken = chain_break(rows, chain)
+    broken_at = parse_time(broken.get("timestamp")) if broken else None
+    broken_label = (iso_label(broken.get("timestamp"), tz) or "（时间未知）") if broken else None
+
     if args.list_turns:
+        if broken:
+            print(f"警告：会话链在 {broken_label} 附近断开（那一行的 parentUuid 在文件里找不到），"
+                  "下面只列得出断点之后的轮次；断点之前的内容 slim.py 沿链走不到。")
         for n, t in enumerate(turns):
             head = prompt_text(chain[t["start"]]).replace("\n", " ")[:50]
             label = short_label(chain[t["start"]].get("timestamp"), tz) or "?"
@@ -850,6 +924,11 @@ def run(args):
         if first is None:
             raise SlimError("这个时间点之后没有完整的轮次。")
     check_preserved_compaction(rows, chain, turns, first, tz)
+    if broken and not (not args.all and broken_at and cut_at > broken_at):
+        raise SlimError(
+            f"会话链在 {broken_label} 附近断开：那一行的 parentUuid 指向一行文件里找不到的消息。"
+            "Claude Code 恢复时会按时间戳把断点接回去，slim.py 不会；硬切会把断点之前的内容静默丢掉，"
+            f"所以这次不写文件。如果断点之前的内容本来就不要，把 --from 设成晚于 {broken_label} 的时间再试。")
     kept = chain[turns[first]["begin"]:]
     extra = sibling_results(rows, chain)
 
@@ -903,13 +982,16 @@ def run(args):
               f"（因此整行删掉 {stats['dropped_rows']} 行），图片 {kept_images} 张原样带过去")
     else:
         print(f"保留段里：丢掉工具调用 {stats['dropped_tools']} 次，thinking {stats['thinking']} 块，"
-              f"图片 {kept_images} 张（只留占位）")
+              f"图片 {kept_images} 张（只留占位），"
+              f"工具结果行里夹带的人类文字 {stats.get('interjections', 0)} 条（单独带过去）")
     print(f"源保留段工具调用 {len(want)} / 产物 {len(want) - len(missing_ids)}"
           f"（源主线含捞回的并行旁支 {recover_stats.get('recovered_sibling_rows', 0)} 行；"
           + ("full 数全部有结果的调用" if keep_tools is None else "dialogue 只数要保留且有结果的工具")
           + "）")
     print(f"新会话 {len(out_rows)} 行，产物 {len(data)} 字节，"
           f"粗估约 {len(data) // 3} token（字节÷3 的粗估，只看量级）")
+    if broken:
+        print(f"警告：会话链在 {broken_label} 附近断开；切点在断点之后，断点之前的内容本来就切掉，照常继续")
     if stats["renamed_tool_ids"]:
         print(f"注意：{stats['renamed_tool_ids']} 个 tool_use id 不合法或重复，已换成新 id")
     missing = stats["no_time_prompts"] + stats["no_time_rows"]

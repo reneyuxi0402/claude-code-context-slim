@@ -579,6 +579,96 @@ class SlimTest(unittest.TestCase):
         self.assertIn("源侧保全检查没通过", err)
         self.assertEqual(self.outputs(), [])
 
+    def interjection_session(self, tool="mcp__voice__listen"):
+        b = Builder()
+        b.prompt("开始")                                                  # 07:01
+        b.assistant([use("toolu_a", tool)], "msg_a")                      # 07:02
+        r = b.result("toolu_a", "工具结果")                                # 07:03
+        r["message"]["content"].append({"type": "text", "text": "<system-reminder>系统注入</system-reminder>"})
+        r["message"]["content"].append({"type": "text", "text": "她插的一句话"})
+        b.assistant([{"type": "text", "text": "收到插话"}], "msg_b")       # 07:04
+        b.write(self.src)
+        return b
+
+    def test_interjection_in_tool_result_kept(self):
+        # 工具对被保留：插话紧跟那一对；系统注入不带
+        self.interjection_session()
+        code, out, err = self.run_slim("--all", "--tz", "UTC")
+        self.assertEqual(code, 0, err)
+        self.assertIn("工具结果行里夹带的人类文字 1 条", out)
+        (path,) = self.outputs()
+        rows = read_jsonl(path)
+        self.assertEqual(slim.validate(rows, rows[0]["sessionId"]), [])
+        shape = [(r["type"], tuple(b["type"] for b in slim.blocks(r))) for r in rows]
+        self.assertEqual(shape, [("user", ()), ("assistant", ("tool_use",)), ("user", ("tool_result",)),
+                                 ("user", ()), ("assistant", ("text",))])
+        self.assertEqual(rows[3]["message"]["content"],
+                         "[消息发送时间：2026-09-30T07:03:00+00:00]\n她插的一句话")
+        self.assertNotIn("系统注入", read_text(path))
+        # 二次 slim：插话已经是普通的话，前缀不叠加
+        out_io, err_io = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_io), contextlib.redirect_stderr(err_io):
+            self.assertEqual(slim.main([path, "--all", "--tz", "UTC"]), 0, err_io.getvalue())
+        (second,) = [p for p in self.outputs() if p != path]
+        self.assertEqual(read_text(second).count("[消息发送时间："), 2)
+
+    def test_interjection_when_tool_dropped(self):
+        # 工具不保留（Bash）：调用和结果丢掉，插话仍然在原位置带过去
+        self.interjection_session(tool="Bash")
+        code, out, err = self.run_slim("--all", "--no-time")
+        self.assertEqual(code, 0, err)
+        (path,) = self.outputs()
+        rows = read_jsonl(path)
+        self.assertEqual([(r["type"], r["message"]["content"] if r["type"] == "user" else None)
+                          for r in rows],
+                         [("user", "开始"), ("user", "她插的一句话"), ("assistant", None)])
+        self.assertNotIn("toolu_a", read_text(path))
+        self.assertIn("工具结果行里夹带的人类文字 1 条", out)
+        # full 原行照搬：文字块和结果同一行
+        code, out, err = self.run_slim("--from", "2026-09-30T07:00:00Z", "--history", "full")
+        self.assertEqual(code, 0, err)
+        full = [p for p in self.outputs() if p != path][0]
+        self.assertIn("她插的一句话", read_text(full))
+
+    def broken_chain_session(self):
+        b = Builder()
+        b.prompt("断点之前的问")                                           # 07:01
+        b.assistant([{"type": "text", "text": "断点之前的答"}], "msg_a")    # 07:02
+        b.add("user", "断点之后的问", parent="missing-parent-uuid")          # 07:03
+        b.assistant([{"type": "text", "text": "断点之后的答"}], "msg_b")    # 07:04
+        b.prompt("再后来的问")                                             # 07:05
+        b.assistant([{"type": "text", "text": "再后来的答"}], "msg_c")      # 07:06
+        b.write(self.src)
+
+    def test_broken_chain_refused(self):
+        self.broken_chain_session()
+        for args in (["--all"], ["--from", "2026-09-30T07:00:00Z", "--history", "full"],
+                     ["--from", "2026-09-30T07:03:00Z", "--dry-run"]):
+            with self.subTest(args=args):
+                code, out, err = self.run_slim(*args, "--tz", "UTC")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("会话链在 2026-09-30T07:03:00+00:00 附近断开", err)
+                self.assertIn("按时间戳", err)
+                self.assertEqual(self.outputs(), [])
+        code, out, err = self.run_slim("--list-turns", "--tz", "UTC")
+        self.assertEqual(code, 0, err)
+        self.assertIn("警告：会话链在 2026-09-30T07:03:00+00:00 附近断开", out)
+
+    def test_broken_chain_cut_after_break_ok(self):
+        self.broken_chain_session()
+        for args in (["--from", "2026-09-30T07:05:00Z"],
+                     ["--from", "2026-09-30T07:05:00Z", "--history", "full"]):
+            with self.subTest(args=args):
+                for p in self.outputs():
+                    os.remove(p)
+                code, out, err = self.run_slim(*args, "--tz", "UTC")
+                self.assertEqual(code, 0, err)
+                self.assertIn("警告：会话链在 2026-09-30T07:03:00+00:00 附近断开", out)
+                (path,) = self.outputs()
+                text = read_text(path)
+                self.assertIn("再后来的问", text)
+                self.assertNotIn("断点之前", text)
+
 
 if __name__ == "__main__":
     unittest.main()
