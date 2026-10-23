@@ -669,6 +669,35 @@ class SlimTest(unittest.TestCase):
                 self.assertIn("再后来的问", text)
                 self.assertNotIn("断点之前", text)
 
+    def test_broken_chain_mid_turn_refused(self):
+        # 断点在一轮中间：--from 晚于断点也不能放行，否则只留下半截回答
+        b = Builder()
+        b.prompt("必须保留的问")                                               # 07:01
+        b.assistant([{"type": "text", "text": "回答前半段"}], "msg_a")          # 07:02
+        b.add("assistant", [{"type": "text", "text": "断点后的回答"}], parent="missing-parent")  # 07:03
+        b.assistant([{"type": "text", "text": "回答结尾"}], "msg_c")            # 07:04
+        b.prompt("下一轮的问")                                                 # 07:05
+        b.assistant([{"type": "text", "text": "下一轮的答"}], "msg_d")          # 07:06
+        b.prompt("第三轮的问")                                                 # 07:07
+        b.assistant([{"type": "text", "text": "第三轮的答"}], "msg_e")          # 07:08
+        b.write(self.src)
+        for history in ("dialogue", "full"):
+            with self.subTest(history=history):
+                code, out, err = self.run_slim("--from", "2026-09-30T07:03:30Z", "--history", history,
+                                               "--no-time", "--tz", "UTC")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("断点落在一轮的中间", err)
+                self.assertIn("2026-09-30T07:06:00+00:00", err)
+                self.assertEqual(self.outputs(), [])
+        # 挪到混着残片的那一轮之后：只留第三轮，照常写，带断链警告
+        code, out, err = self.run_slim("--from", "2026-09-30T07:06:30Z", "--tz", "UTC")
+        self.assertEqual(code, 0, err)
+        self.assertIn("警告：会话链", out)
+        (path,) = self.outputs()
+        text = read_text(path)
+        self.assertIn("第三轮的问", text)
+        self.assertNotIn("断点后的回答", text)
+
 
 if __name__ == "__main__":
     unittest.main()

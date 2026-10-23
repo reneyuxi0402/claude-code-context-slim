@@ -924,6 +924,17 @@ def run(args):
         if first is None:
             raise SlimError("这个时间点之后没有完整的轮次。")
     check_preserved_compaction(rows, chain, turns, first, tz)
+    # 断点落在一轮中间时，断点后的残片会被算进下一轮的开头（begin=0）；
+    # 只要保留段还从这些残片开始，就算 --from 晚于断点也不安全，同样拒绝
+    fragment_kept = broken is not None and turns[first]["begin"] == 0 and not is_prompt(chain[0])
+    if fragment_kept and not args.all and broken_at and cut_at > broken_at:
+        raise SlimError(
+            f"会话链在 {broken_label} 附近断开，而且断点落在一轮的中间：断点之后那几行是上一轮回答的后半段，"
+            "这一轮的提问和回答前半段在断点之前、沿链走不到。按现在的 --from，新会话会从这半截回答开始，"
+            "前半轮被静默丢掉，所以这次不写文件。Claude Code 恢复时会按时间戳接回，slim.py 不会。"
+            + (f"要 slim 的话，把 --from 设成晚于 {iso_label(turns[0]['ended'].isoformat(), tz)}"
+               "（混着残片的那一轮结束之后），只保留之后完整的轮次。"
+               if len(turns) > 1 and turns[0]["ended"] else "断点之后没有完整的轮次可以单独保留。"))
     if broken and not (not args.all and broken_at and cut_at > broken_at):
         raise SlimError(
             f"会话链在 {broken_label} 附近断开：那一行的 parentUuid 指向一行文件里找不到的消息。"
