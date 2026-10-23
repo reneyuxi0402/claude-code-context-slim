@@ -48,6 +48,7 @@ THINKING_TYPES = {"thinking", "redacted_thinking"}
 TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 # 语音类工具：电话里她说的话只存在于 listen 的返回里，念出口的话只存在于 speak 的输入里，
 # 剥掉就两边都没了。所以默认成对保留，--no-voice 关掉。
+TIME_PREFIX_RE = re.compile(r"^\[消息发送时间：[^\]\n]*\]\n")
 VOICE_TOOLS = ("mcp__tts__speak", "mcp__voice__speak", "mcp__voice__listen",
                "mcp__voice__converse", "mcp__voice__hangup")
 
@@ -112,12 +113,201 @@ def result_ids(row):
     return [b.get("tool_use_id") for b in blocks(row) if b.get("type") == "tool_result"]
 
 
+def _is_meta_tail(row):
+    """CLI 恢复时会跟着并行调用一起捞回来的「附属行」：附件、非压缩边界的 system、isMeta 的 user。"""
+    kind = row.get("type")
+    if kind == "attachment":
+        return True
+    if kind == "system":
+        return row.get("subtype") != "compact_boundary"
+    return kind == "user" and row.get("isMeta") is True and not result_ids(row)
+
+
+def _belongs_to_group(row, mid):
+    """主线上紧跟一组并行调用、仍算这一组的行（同一 message.id 的 assistant、结果、附属行）。"""
+    kind = row.get("type")
+    if kind == "assistant":
+        return mid is not None and (row.get("message") or {}).get("id") == mid
+    if kind == "user":
+        return row.get("isMeta") is True or bool(result_ids(row))
+    if kind == "attachment":
+        return True
+    if kind == "system":
+        return row.get("subtype") != "compact_boundary"
+    return False
+
+
+def recover_siblings(rows, chain, stats=None):
+    """把并行调用留在旁支上的行接回主线，照 CLI 恢复会话时的做法（2.1.278 的 l3o）。
+
+    一条 assistant 回复（同一个 message.id）里的多个 tool_use，CLI 是分成几行记的；
+    结果完成的顺序和调用顺序不一定一样，后面的对话接在哪个结果下面，主线就只经过哪一支。
+    所以按主线上每个 message.id 把同组的 assistant 行、挂在它们下面的结果行、
+    以及结果后面一串纯附属行（附件、提醒）都捞回来，按文件里的先后插回这一组所在的位置。
+    """
+    main = [r for r in rows if r.get("uuid") and r.get("isSidechain") is not True
+            and r.get("type") in CHAIN_TYPES]
+    order, by_mid, results_under, children = {}, {}, {}, {}
+    for n, r in enumerate(main):
+        order.setdefault(r["uuid"], n)
+    seen_uuid = set()
+    for r in main:
+        if r["uuid"] in seen_uuid:
+            continue
+        seen_uuid.add(r["uuid"])
+        mid = (r.get("message") or {}).get("id") if r.get("type") == "assistant" else None
+        if mid:
+            by_mid.setdefault(mid, []).append(r)
+        elif r.get("type") == "user" and r.get("parentUuid") and result_ids(r):
+            results_under.setdefault(r["parentUuid"], []).append(r)
+        if r.get("parentUuid"):
+            children.setdefault(r["parentUuid"], []).append(r)
+
+    taken = {r.get("uuid") for r in chain}
+    pos = {r.get("uuid"): n for n, r in enumerate(chain)}
+
+    def meta_tail(start, parent):
+        out, row = [], start
+        while row is not None:
+            if row["uuid"] in taken or row.get("isSidechain") != parent.get("isSidechain") \
+                    or not _is_meta_tail(row):
+                return []
+            out.append(row)
+            nxt = [c for c in children.get(row["uuid"], []) if c["uuid"] not in taken]
+            if len(nxt) > 1:
+                return []
+            row = nxt[0] if nxt else None
+        return out
+
+    spans, done, n_rows, n_tail = [], set(), 0, 0
+    for r in chain:
+        if r.get("type") != "assistant":
+            continue
+        mid = (r.get("message") or {}).get("id")
+        if not mid or mid in done:
+            continue
+        done.add(mid)
+        group = by_mid.get(mid, [r])
+        got = [g for g in group if g["uuid"] not in taken]
+        got += [x for g in group for x in results_under.get(g["uuid"], []) if x["uuid"] not in taken]
+        for x in got:
+            taken.add(x["uuid"])
+        if any(use_ids(g) for g in group):
+            heads = group + [x for g in group for x in results_under.get(g["uuid"], [])]
+            for h in heads:
+                for c in children.get(h["uuid"], []):
+                    tail = meta_tail(c, h)
+                    for x in tail:
+                        taken.add(x["uuid"])
+                    got += tail
+                    n_tail += len(tail)
+        if not got:
+            continue
+        n_rows += len(got)
+        start = pos[r["uuid"]]
+        end = start + 1
+        for g in group:
+            p = pos.get(g["uuid"])
+            if p is not None and p >= end:
+                end = p + 1
+        while end < len(chain) and _belongs_to_group(chain[end], mid):
+            end += 1
+        got.sort(key=lambda x: order.get(x["uuid"], len(main)))
+        spans.append([start, end, got])
+
+    if stats is not None:
+        stats["recovered_sibling_rows"] = n_rows
+    if not spans:
+        return list(chain)
+    spans.sort(key=lambda s: s[0])
+    merged = []
+    for s in spans:
+        if merged and s[0] < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], s[1])
+            merged[-1][2] = sorted(merged[-1][2] + s[2], key=lambda x: order.get(x["uuid"], len(main)))
+        else:
+            merged.append(s)
+    out, cursor = [], 0
+    for start, end, got in merged:
+        out.extend(chain[cursor:start + 1])
+        k = 0
+        for row in chain[start + 1:end]:
+            here = order.get(row["uuid"], len(main))
+            while k < len(got) and order.get(got[k]["uuid"], len(main)) < here:
+                out.append(got[k])
+                k += 1
+            out.append(row)
+        out.extend(got[k:])
+        cursor = end
+    out.extend(chain[cursor:])
+    return out
+
+
+def preserved_compactions(rows):
+    """带 preservedSegment / preservedMessages 的压缩边界：[(边界行, anchor uuid, 保留段 uuid 列表)]。
+
+    这种压缩会把压缩前的一小段原话留着，CLI 恢复时把它接到摘要后面
+    （边界 → 摘要 → 保留段 → 之后的对话）。这段接线不在 parentUuid 里，沿链回溯走不到。
+    """
+    by_uuid = {}
+    for r in rows:
+        if r.get("uuid"):
+            by_uuid.setdefault(r["uuid"], r)
+    found = []
+    for r in rows:
+        if r.get("isSidechain") is True or r.get("type") != "system" \
+                or r.get("subtype") != "compact_boundary":
+            continue
+        meta = r.get("compactMetadata") or {}
+        seg, msgs = meta.get("preservedSegment"), meta.get("preservedMessages")
+        if not seg and not msgs:
+            continue
+        anchor = (msgs or {}).get("anchorUuid") or (seg or {}).get("anchorUuid")
+        uuids = list((msgs or {}).get("uuids") or [])
+        if not uuids and isinstance(seg, dict) and seg.get("tailUuid"):
+            row, guard = by_uuid.get(seg["tailUuid"]), 0
+            while row is not None and guard < 100000:
+                uuids.append(row["uuid"])
+                if row["uuid"] == seg.get("headUuid"):
+                    break
+                row, guard = by_uuid.get(row.get("parentUuid")), guard + 1
+            uuids.reverse()
+        found.append((r, anchor, uuids))
+    return found
+
+
+def check_preserved_compaction(rows, chain, turns, first, tz=None):
+    """保留段会被切进新会话、却又没按 CLI 的方式接在摘要后面时，拒绝写出。"""
+    pos = {r.get("uuid"): n for n, r in enumerate(chain)}
+    kept_from = turns[first]["begin"]
+    for boundary, anchor, uuids in preserved_compactions(rows):
+        marks = [boundary.get("uuid"), anchor] + uuids
+        idx = [pos[m] for m in marks if m in pos]
+        if not idx or max(idx) < kept_from:
+            continue  # 这次压缩整个落在切掉的那一段里（或者是已经不在主线上的旧压缩）
+        linked = (all(m in pos for m in marks) and pos[boundary["uuid"]] < pos[anchor]
+                  and all(pos[anchor] < pos[u] for u in uuids))
+        if linked:
+            continue  # 保留段已经实实在在接在摘要后面，主线上一样不少
+        later = next((t for t in turns if t["begin"] > max(idx)), None)
+        hint = (f"要 slim 的话，把 --from 设成 {iso_label(chain[later['start']].get('timestamp'), tz) or '压缩之后那一轮的时间'}"
+                f" 或更晚（只保留这次压缩之后的轮次）"
+                if later else "这次压缩之后还没有完整的轮次，先在 Claude Code 里接着聊几轮再 slim")
+        raise SlimError(
+            "这份会话被 Claude Code 压缩过，而且压缩时留了一段压缩前的原话"
+            "（compactMetadata.preservedSegment / preservedMessages）。"
+            "Claude Code 恢复时会把它接成 压缩边界 → 摘要 → 保留的原话 → 之后的对话，"
+            "这段接线不在 parentUuid 里；slim.py 还不会照着接，硬切会把摘要或保留的原话静默丢掉，"
+            f"所以这次不写文件。{hint}。")
+
+
 def sibling_results(rows, chain):
     """并行工具调用的结果，有一部分不在主线上。
 
     Claude Code 记并行调用时，每个结果行挂在自己那条调用行下面，
     从最后一行往回走只会经过最后一个结果，前面几个结果在旁支上（CLI 恢复时自己会捞回来）。
     这里同样捞回来：tool_use_id → 那条结果行（不在主线、不是子 agent）。
+    recover_siblings 之后大多已经在主线上，这里是兜底。
     """
     on_chain = {r.get("uuid") for r in chain}
     found = {}
@@ -274,7 +464,9 @@ def project_dialogue(kept, keep_tools, extra_results, add_time, tz, stats):
                 text = prompt_text(row)
                 if text.startswith(("<command-", "<local-command-")):
                     continue  # 斜杠命令和它的输出，不是对话
-                if add_time:
+                if add_time and TIME_PREFIX_RE.match(text):
+                    pass  # 上一次 slim 已经加过发送时间，不再叠一层
+                elif add_time:
                     label = iso_label(ts, tz)
                     if label:
                         text = f"[消息发送时间：{label}]\n{text}"
@@ -297,8 +489,9 @@ def project_dialogue(kept, keep_tools, extra_results, add_time, tz, stats):
 
 
 def build_dialogue_rows(events, session_id, cwd, model, stats):
-    rows, parent, pending = [], None, []
+    rows, parent, pending, pending_ts = [], None, [], None
     used_ids = set()
+    stats.setdefault("id_map", [])
     known = [ts for _, _, ts in events if parse_time(ts)]
     fallback = known[0] if known else datetime.now(timezone.utc).isoformat()
 
@@ -320,13 +513,20 @@ def build_dialogue_rows(events, session_id, cwd, model, stats):
         rows.append(row)
         parent = u
 
-    def flush(ts):
-        nonlocal pending
+    def add_pending(block, ts):
+        # 攒着的 assistant 内容记它自己最后一个事件的时间，不借下一条 user 的时间
+        nonlocal pending_ts
+        pending.append(block)
+        if parse_time(ts) or pending_ts is None:
+            pending_ts = ts
+
+    def flush():
+        nonlocal pending, pending_ts
         if pending:
             message = {"id": "msg_" + uuid.uuid4().hex, "type": "message",
                        "role": "assistant", "model": model, "content": pending}
-            push("assistant", message, ts)
-            pending = []
+            push("assistant", message, pending_ts)
+            pending, pending_ts = [], None
 
     def tool_id(raw):
         tid = str(raw or "")
@@ -334,30 +534,29 @@ def build_dialogue_rows(events, session_id, cwd, model, stats):
             tid = "toolu_vslim_" + uuid.uuid4().hex
             stats["renamed_tool_ids"] += 1
         used_ids.add(tid)
+        stats["id_map"].append((raw, tid))
         return tid
 
-    last_ts = None
     for kind, payload, ts in events:
-        last_ts = ts
         if kind == "user":
-            flush(ts)
+            flush()
             push("user", {"role": "user", "content": payload}, ts)
         elif kind == "text":
-            pending.append({"type": "text", "text": payload})
+            add_pending({"type": "text", "text": payload}, ts)
         elif kind == "tool_pair":
             use = payload["use"]
             block, tool_use_result, result_ts = payload["result"]
             tid = tool_id(use.get("id"))
-            pending.append({"type": "tool_use", "id": tid, "name": use.get("name"),
-                            "input": use.get("input") or {}})
-            flush(ts)  # 调用结束这条 assistant 消息，下一行紧跟它的结果
+            add_pending({"type": "tool_use", "id": tid, "name": use.get("name"),
+                         "input": use.get("input") or {}}, ts)
+            flush()  # 调用结束这条 assistant 消息，下一行紧跟它的结果
             result = {"type": "tool_result", "tool_use_id": tid,
                       "content": block.get("content", "")}
             if block.get("is_error"):
                 result["is_error"] = True
             extra = {"toolUseResult": tool_use_result} if tool_use_result is not None else None
             push("user", {"role": "user", "content": [result]}, result_ts or ts, extra)
-    flush(last_ts)
+    flush()
     return rows
 
 
@@ -468,6 +667,35 @@ def build_full_rows(kept, extra_results, session_id, cwd_override, stats):
 
 
 # ---------- 自检 ----------
+
+def source_preservation(kept, extra, out_rows, keep_tools, id_map):
+    """源侧保全检查：保留段（源主线 + 捞回的旁支）里应该带过去的 tool_use，产物里必须都有。
+
+    「应该带过去」只按源来定，不看构建过程：有结果（在保留段里或旁支上）的调用；
+    dialogue 再限定在要保留的工具里（keep_tools），full 是全部。
+    没结果的调用（比如正在跑 slim 的这一次）两种模式都会去掉，不算。
+    返回 (应保留的源 id 列表, 产物里找不到的源 id 列表)。
+    """
+    answered = {i for r in kept for i in result_ids(r)} | set(extra)
+    want = []
+    for r in kept:
+        for b in blocks(r):
+            if r.get("type") != "assistant" or b.get("type") != "tool_use":
+                continue
+            if b.get("id") not in answered:
+                continue
+            if keep_tools is not None and b.get("name") not in keep_tools:
+                continue
+            want.append(b.get("id"))
+    out_ids = {i for r in out_rows for i in use_ids(r)}
+    out_results = {i for r in out_rows for i in result_ids(r)}
+    if keep_tools is None:
+        produced = {i for i in out_ids if i in out_results}
+    else:  # dialogue 可能给不合法、重复的 id 换了新名字
+        produced = {raw for raw, new in id_map if new in out_ids and new in out_results}
+    missing = [i for i in dict.fromkeys(want) if i not in produced]
+    return want, missing
+
 
 def validate(rows, session_id):
     """写文件之前的自检。返回问题列表（只含行号和 id，不含任何内容）；空列表才写。"""
@@ -589,7 +817,8 @@ def run(args):
         print(tz_note)
 
     rows = load_rows(args.source)
-    chain = active_chain(rows)
+    recover_stats = {}
+    chain = recover_siblings(rows, active_chain(rows), recover_stats)
     turns = split_turns(chain)
     if not turns:
         raise SlimError("这份文件里找不到对话轮次。")
@@ -620,6 +849,7 @@ def run(args):
         first = next((i for i, t in enumerate(turns) if t["ended"] and t["ended"] >= cut_at), None)
         if first is None:
             raise SlimError("这个时间点之后没有完整的轮次。")
+    check_preserved_compaction(rows, chain, turns, first, tz)
     kept = chain[turns[first]["begin"]:]
     extra = sibling_results(rows, chain)
 
@@ -634,12 +864,13 @@ def run(args):
         raise SlimError("--cwd 必须是绝对路径。")
 
     stats = {"no_time_prompts": 0, "no_time_rows": 0, "renamed_tool_ids": 0, "thinking": 0,
-             "dropped_rows": 0, "dropped_tools": 0, "recovered_results": 0}
+             "dropped_rows": 0, "dropped_tools": 0, "recovered_results": 0, "id_map": []}
     kept_uses = sum(1 for r in kept for b in blocks(r) if b.get("type") == "tool_use")
     kept_thinking = sum(1 for r in kept for b in blocks(r) if b.get("type") in THINKING_TYPES)
     kept_images = sum(1 for r in kept for b in blocks(r) if b.get("type") == "image")
 
     new_id = str(uuid.uuid4())
+    keep_tools = None
     if args.history == "full":
         if args.keep_tool or args.no_voice:
             print("提示：full 模式保留全部工具，--keep-tool / --no-voice 不起作用。")
@@ -655,6 +886,7 @@ def run(args):
         stats["thinking"] = kept_thinking
 
     problems = validate(out_rows, new_id)
+    want, missing_ids = source_preservation(kept, extra, out_rows, keep_tools, stats["id_map"])
     data = serialize(out_rows)
 
     # ---- 统计 ----
@@ -672,6 +904,10 @@ def run(args):
     else:
         print(f"保留段里：丢掉工具调用 {stats['dropped_tools']} 次，thinking {stats['thinking']} 块，"
               f"图片 {kept_images} 张（只留占位）")
+    print(f"源保留段工具调用 {len(want)} / 产物 {len(want) - len(missing_ids)}"
+          f"（源主线含捞回的并行旁支 {recover_stats.get('recovered_sibling_rows', 0)} 行；"
+          + ("full 数全部有结果的调用" if keep_tools is None else "dialogue 只数要保留且有结果的工具")
+          + "）")
     print(f"新会话 {len(out_rows)} 行，产物 {len(data)} 字节，"
           f"粗估约 {len(data) // 3} token（字节÷3 的粗估，只看量级）")
     if stats["renamed_tool_ids"]:
@@ -682,6 +918,10 @@ def run(args):
               f"（{stats['no_time_prompts']} 条人说的话没加上发送时间，"
               f"{stats['no_time_rows']} 行借用了前一行的时间或保持原样）")
 
+    if missing_ids:
+        raise SlimError(f"源侧保全检查没通过：保留段里有 {len(missing_ids)} 个应该带过去的工具调用"
+                        "在新会话里找不到（产物自检通过不代表内容没丢）。不写文件。"
+                        "这是 slim.py 的缺陷，请把这份会话的形状（不含正文）报给作者。")
     if problems:
         print("自检没通过，不写文件：", file=sys.stderr)
         for p in problems[:20]:

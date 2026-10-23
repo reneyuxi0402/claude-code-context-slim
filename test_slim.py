@@ -382,6 +382,203 @@ class SlimTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("缺时间戳", out)
 
+    # ---- 第四版补的边界 ----
+
+    def unordered_session(self):
+        """一条回复里并行调用 A、B，完成顺序 B→A，后续对话接在 A 的结果下面：B 的调用行和结果都在旁支上。"""
+        b = Builder()
+        b.prompt("两个一起来")
+        u1 = b.assistant([use("toolu_slow", "mcp__voice__listen")], "msg_par")
+        u2 = b.assistant([use("toolu_fast", "mcp__tts__speak")], "msg_par")
+        b.result("toolu_fast", "fast-result", parent=u2["uuid"])
+        b.result("toolu_slow", "slow-result", parent=u1["uuid"])
+        b.assistant([{"type": "text", "text": "都好了"}], "msg_end")
+        b.write(self.src)
+        return b
+
+    @staticmethod
+    def tool_seq(rows):
+        seq = []
+        for r in rows:
+            for blk in slim.blocks(r):
+                if blk["type"] == "tool_use":
+                    seq.append(("use", blk["id"]))
+                elif blk["type"] == "tool_result":
+                    seq.append(("result", blk["tool_use_id"]))
+        return seq
+
+    def test_unordered_parallel_dialogue_keeps_both(self):
+        self.unordered_session()
+        # 修之前：主线上只有 slow 那一支，fast 的调用行和结果一起丢
+        self.assertNotIn("toolu_fast", json.dumps(slim.active_chain(slim.load_rows(self.src))))
+        code, out, err = self.run_slim("--all", "--no-time")
+        self.assertEqual(code, 0, err)
+        (path,) = self.outputs()
+        rows = read_jsonl(path)
+        self.assertEqual(slim.validate(rows, rows[0]["sessionId"]), [])
+        self.assertEqual(self.tool_seq(rows), [("use", "toolu_slow"), ("result", "toolu_slow"),
+                                               ("use", "toolu_fast"), ("result", "toolu_fast")])
+        self.assertIn("fast-result", read_text(path))
+        self.assertIn("源保留段工具调用 2 / 产物 2", out)
+
+    def test_unordered_parallel_full_keeps_both(self):
+        self.unordered_session()
+        code, out, err = self.run_slim("--from", "2026-09-30T07:00:00Z", "--history", "full")
+        self.assertEqual(code, 0, err)
+        (path,) = self.outputs()
+        rows = read_jsonl(path)
+        self.assertEqual(slim.validate(rows, os.path.basename(path)[:-6]), [])
+        self.assertEqual(self.tool_seq(rows), [("use", "toolu_slow"), ("result", "toolu_slow"),
+                                               ("use", "toolu_fast"), ("result", "toolu_fast")])
+        self.assertEqual(rows[-1]["message"]["content"][0]["text"], "都好了")
+        self.assertIn("源保留段工具调用 2 / 产物 2", out)
+        self.assertIn("捞回的并行旁支 2 行", out)
+
+    def compact_preserved_session(self, shape):
+        b = Builder()
+        if shape == "reviewer":
+            # 保留段在主线上、边界和摘要不在（新对话接在保留段尾巴下面）
+            p = b.add("user", "压缩前保留的问", parent="physically-pruned-parent")
+            a = b.assistant([{"type": "text", "text": "压缩前保留的答"}], "msg_kept")
+            boundary = b.add("system", parent=None, subtype="compact_boundary", content="compacted",
+                             compactMetadata={"trigger": "auto"})
+            summary = b.add("user", "必须带上的压缩摘要", isCompactSummary=True)
+            b.add("user", "压缩后的问", parent=a["uuid"])
+        else:
+            # 真实会话里见到的形状：边界、摘要在主线上，保留段在边界之前的旁支上
+            b.prompt("更早的问")
+            p = b.prompt("压缩前保留的问")
+            a = b.assistant([{"type": "text", "text": "压缩前保留的答"}], "msg_kept")
+            boundary = b.add("system", parent=None, subtype="compact_boundary", content="compacted",
+                             compactMetadata={"trigger": "auto"}, logicalParentUuid=a["uuid"])
+            summary = b.add("user", "必须带上的压缩摘要", isCompactSummary=True)
+            b.prompt("压缩后的问")
+        boundary["compactMetadata"]["preservedMessages"] = {"anchorUuid": summary["uuid"],
+                                                            "uuids": [p["uuid"], a["uuid"]]}
+        boundary["compactMetadata"]["preservedSegment"] = {"anchorUuid": summary["uuid"],
+                                                           "headUuid": p["uuid"], "tailUuid": a["uuid"]}
+        b.assistant([{"type": "text", "text": "压缩后的答"}], "msg_post")
+        b.prompt("再后来的问")
+        b.assistant([{"type": "text", "text": "再后来的答"}], "msg_later")
+        b.write(self.src)
+        return b
+
+    def test_compact_preserved_tail_refused(self):
+        for shape in ("reviewer", "native"):
+            for args in (["--all"], ["--from", "2026-09-30T07:00:00Z", "--history", "full"],
+                         ["--from", "2026-09-30T07:00:00Z", "--dry-run"]):
+                with self.subTest(shape=shape, args=args):
+                    for p in self.outputs():
+                        os.remove(p)
+                    self.compact_preserved_session(shape)
+                    code, out, err = self.run_slim(*args, "--tz", "UTC")
+                    self.assertEqual(code, 1, out + err)
+                    self.assertIn("preservedSegment", err)
+                    self.assertIn("不写文件", err)
+                    self.assertEqual(self.outputs(), [])
+            # 切点放在这次压缩之后的轮次：保留段整个落在切掉的部分，可以照常 slim
+            with self.subTest(shape=shape, after_compaction=True):
+                self.compact_preserved_session(shape)
+                code, out, err = self.run_slim("--from", "2026-09-30T07:08:00Z", "--tz", "UTC")
+                self.assertEqual(code, 0, err)
+                (path,) = self.outputs()
+                text = read_text(path)
+                self.assertIn("再后来的问", text)
+                self.assertNotIn("压缩前保留的", text)
+                os.remove(path)
+
+    def test_compact_preserved_already_linked_ok(self):
+        # 保留段已经实实在在接在摘要后面（主线上一样不少）：不拒绝
+        b = Builder()
+        boundary = b.add("system", parent=None, subtype="compact_boundary", content="compacted",
+                         compactMetadata={"trigger": "auto"})
+        summary = b.add("user", "压缩摘要", isCompactSummary=True)
+        p = b.prompt("保留的问")
+        a = b.assistant([{"type": "text", "text": "保留的答"}], "msg_kept")
+        boundary["compactMetadata"]["preservedMessages"] = {"anchorUuid": summary["uuid"],
+                                                            "uuids": [p["uuid"], a["uuid"]]}
+        b.prompt("之后的问")
+        b.assistant([{"type": "text", "text": "之后的答"}], "msg_post")
+        b.write(self.src)
+        code, out, err = self.run_slim("--all", "--no-time")
+        self.assertEqual(code, 0, err)
+        (path,) = self.outputs()
+        text = read_text(path)
+        for want in ("压缩摘要", "保留的问", "保留的答", "之后的答"):
+            self.assertIn(want, text)
+
+    def test_repeat_slim_times_and_cut(self):
+        b = Builder()
+        b.prompt("P1")                                          # 07:01
+        b.assistant([{"type": "text", "text": "A1"}], "msg_a")  # 07:02
+        b.prompt("P2")                                          # 07:03
+        b.assistant([{"type": "text", "text": "A2"}], "msg_b")  # 07:04
+        b.write(self.src)
+        code, out, err = self.run_slim("--all", "--tz", "UTC")
+        self.assertEqual(code, 0, err)
+        (first,) = self.outputs()
+        rows = read_jsonl(first)
+        times = [(r["type"], r["timestamp"][11:16]) for r in rows]
+        self.assertEqual(times, [("user", "07:01"), ("assistant", "07:02"),
+                                 ("user", "07:03"), ("assistant", "07:04")])
+
+        out_io, err_io = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_io), contextlib.redirect_stderr(err_io):
+            code = slim.main([first, "--from", "2026-09-30T07:03:00Z", "--tz", "UTC"])
+        self.assertEqual(code, 0, err_io.getvalue())
+        self.assertIn("切掉 1 轮", out_io.getvalue())
+        (second,) = [p for p in self.outputs() if p != first]
+        rows2 = read_jsonl(second)
+        self.assertEqual([r["type"] for r in rows2], ["user", "assistant"])
+        # 发送时间前缀不重复叠加
+        self.assertEqual(rows2[0]["message"]["content"], "[消息发送时间：2026-09-30T07:03:00+00:00]\nP2")
+        self.assertNotIn("A1", read_text(second))
+
+    def test_time_prefix_not_stacked_on_all(self):
+        b = Builder()
+        b.prompt("[消息发送时间：2026-09-30T15:01:00+08:00]\n已经带过时间的话")
+        b.assistant([{"type": "text", "text": "嗯"}], "msg_a")
+        b.write(self.src)
+        code, out, err = self.run_slim("--all", "--tz", "Asia/Shanghai")
+        self.assertEqual(code, 0, err)
+        (path,) = self.outputs()
+        content = read_jsonl(path)[0]["message"]["content"]
+        self.assertEqual(content.count("[消息发送时间："), 1)
+
+    def test_source_preservation_blocks_dropped_call(self):
+        # full：构建过程人为丢一对调用（产物本身仍然自洽，validate 拦不住）
+        self.unordered_session()
+        real_full = slim.build_full_rows
+
+        def lossy_full(*a, **k):
+            rows = real_full(*a, **k)
+            out = [r for r in rows if "toolu_fast" not in json.dumps(r)]
+            parent = None
+            for r in out:
+                r["parentUuid"] = parent
+                parent = r["uuid"]
+            return out
+
+        with mock.patch.object(slim, "build_full_rows", side_effect=lossy_full):
+            code, out, err = self.run_slim("--from", "2026-09-30T07:00:00Z", "--history", "full")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("源侧保全检查没通过", err)
+        self.assertIn("源保留段工具调用 2 / 产物 1", out)
+        self.assertEqual(self.outputs(), [])
+
+        # dialogue：投影时人为丢一对
+        real_project = slim.project_dialogue
+
+        def lossy_project(*a, **k):
+            return [e for e in real_project(*a, **k)
+                    if not (e[0] == "tool_pair" and e[1]["use"].get("id") == "toolu_fast")]
+
+        with mock.patch.object(slim, "project_dialogue", side_effect=lossy_project):
+            code, out, err = self.run_slim("--all", "--dry-run")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("源侧保全检查没通过", err)
+        self.assertEqual(self.outputs(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
