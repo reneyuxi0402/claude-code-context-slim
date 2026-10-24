@@ -1,9 +1,0 @@
-{
-  "name": "context-slim-pdf-build",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "marked": "^14.0.0",
-    "puppeteer-core": "^24.0.0"
-  }
-}
